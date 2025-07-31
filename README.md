@@ -55,7 +55,7 @@ Sample Output: See `example_output.xlsx`.
 Run the test:
 
 ```sh
-python test_ioc_validation.py
+python test_ioc_validation.py iocs.txt
 ```
 
 ## License
