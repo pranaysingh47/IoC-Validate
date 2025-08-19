@@ -27,15 +27,48 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Edit `ioc_validation.py` to insert your API keys.
+1. **Configure API keys**: Choose one of these methods:
+   - **Option A**: Create a configuration file:
+     ```sh
+     python configure.py create
+     # Edit config.env with your API keys
+     ```
+   - **Option B**: Set environment variables:
+     ```sh
+     export VT_API_KEY='your_virustotal_key'
+     export ABUSEIPDB_API_KEY='your_abuseipdb_key'
+     export ALIENVAULT_API_KEY='your_alienvault_key'
+     ```
+   - **Option C**: Edit the script directly (not recommended)
+
 2. Prepare a `.txt` or `.csv` file with IoCs (one per line or column).
+
 3. Run:
+   ```sh
+   python IoC_Validate.py example_input.txt
+   ```
+
+4. Output will be a timestamped Excel file in the same directory as the input file.
+
+### Performance Configuration
+
+You can customize performance settings via environment variables:
 
 ```sh
-python ioc_validation.py example_input.txt
-```
+# Batch processing (default: 100)
+export BATCH_SIZE=50
 
-4. Output will be a timestamped Excel file in the same directory.
+# Rate limiting delays in seconds
+export VT_DELAY=15
+export OTHER_API_DELAY=0.5
+
+# Cache management (default: 10000)
+export MAX_CACHE_SIZE=5000
+
+# UI settings
+export CLEAR_CONSOLE=false  # Disable console clearing
+export DEBUG_OUTPUT=true    # Enable debug messages
+```
 
 ## Example
 

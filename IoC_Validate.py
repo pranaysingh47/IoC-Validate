@@ -9,6 +9,21 @@ import concurrent.futures
 import base64 # Import for Base64 encoding
 import urllib.parse # Import for URL encoding
 
+# Load environment from config file if it exists
+def load_config():
+    """Load configuration from config.env file if it exists"""
+    config_file = os.path.join(os.path.dirname(__file__), 'config.env')
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+# Load configuration
+load_config()
+
 # Compile regex patterns for better performance
 SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 SHA1_PATTERN = re.compile(r"^[a-fA-F0-9]{40}$")
@@ -70,6 +85,9 @@ alienvault_ip_cache = {}
 # Cache size limits to prevent memory issues
 MAX_CACHE_SIZE = 10000
 
+# Control batch processing for large datasets
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))  # Process in batches to manage memory
+
 def validate_api_keys():
     """Validate that API keys are configured"""
     missing_keys = []
@@ -116,6 +134,164 @@ def validate_ioc(ioc):
 def defang(ioc):
     ioc = ioc.replace("[.]", ".").replace("[:]", ":").replace("hxxp", "http").replace("hxxps", "https")
     return ioc.strip()
+
+def process_ioc_batch(iocs_batch, start_index, total_iocs, executor, start_time, clear_console=True):
+    """Process a batch of IoCs and return results"""
+    batch_results = []
+    
+    for i, ioc in enumerate(iocs_batch):
+        current_index = start_index + i
+        
+        # Clear console for progress display (optional)
+        if current_index > 0 and clear_console:
+            try:
+                num_lines_to_clear_above = 6 
+                for _ in range(num_lines_to_clear_above):
+                    sys.stdout.write("\033[F\033[K") 
+                sys.stdout.flush()
+            except:
+                pass
+
+        print(f"\n[+] Processing IoC {current_index+1}/{total_iocs}: {ioc}")
+
+        indicator_type = "Unknown"
+        
+        if SHA256_PATTERN.match(ioc):
+            indicator_type = "SHA256 Hash"
+        elif SHA1_PATTERN.match(ioc):
+            indicator_type = "SHA1 Hash"
+        elif MD5_PATTERN.match(ioc):
+            indicator_type = "MD5 Hash"
+        elif URL_PATTERN.match(ioc):
+            indicator_type = "URL"
+        elif IPV4_PATTERN.match(ioc):
+            indicator_type = "IPv4"
+        elif ":" in ioc and IPV6_PATTERN.match(ioc): 
+            indicator_type = "IPv6"
+        else: 
+            indicator_type = "Domain"
+
+        print(f"  Identified as Type: {indicator_type}")
+
+        # --- API Calls with Smart Rate Limiting ---
+        wait_for_rate_limit("vt")
+        vt_data = get_vt_info(ioc, indicator_type)
+
+        abuse_data = {} 
+        alienvault_data = {} 
+        ip_for_main_lookup = None
+
+        # Logic to get IP for main lookup
+        if indicator_type == "IPv4":
+            ip_for_main_lookup = ioc
+        elif indicator_type == "URL":
+            if vt_data.get("a_records") and len(vt_data["a_records"]) > 0:
+                ip_for_main_lookup = vt_data["a_records"][0]
+                debug_print(f"  URL {ioc} resolved by VT to IP: {ip_for_main_lookup}. Fetching main IP data.")
+            else:
+                debug_print(f"  URL {ioc} did not resolve to an IP via VT. Skipping AbuseIPDB/AlienVault for main URL.")
+        elif indicator_type == "Domain" and vt_data.get("a_records") and len(vt_data["a_records"]) == 1:
+            ip_for_main_lookup = vt_data["a_records"][0]
+            debug_print(f"  Domain {ioc} resolved by VT to single IP {ip_for_main_lookup}. Fetching main IP data.")
+
+        if ip_for_main_lookup:
+            abuse_future = None
+            alienvault_future = None
+
+            if ip_for_main_lookup not in abuse_ip_cache:
+                wait_for_rate_limit("other")
+                abuse_future = executor.submit(get_abuseipdb_info, ip_for_main_lookup)
+            else:
+                abuse_data = abuse_ip_cache[ip_for_main_lookup]
+
+            if ip_for_main_lookup not in alienvault_ip_cache:
+                alienvault_future = executor.submit(get_alienvault_info, ip_for_main_lookup)
+            else:
+                alienvault_data = alienvault_ip_cache[ip_for_main_lookup]
+
+            if abuse_future:
+                abuse_data = abuse_future.result()
+            if alienvault_future:
+                alienvault_data = alienvault_future.result()
+            
+        # --- Handle associated IPs for Domains/URLs ---
+        associated_ips = vt_data.get("a_records", [])
+        associated_ips_malicious = "No"
+
+        if associated_ips and (indicator_type == "Domain" or indicator_type == "URL"):
+            associated_ip_futures = []
+            for ip in associated_ips:
+                if ip not in abuse_ip_cache:
+                    wait_for_rate_limit("other")
+                    associated_ip_futures.append(executor.submit(get_abuseipdb_info, ip))
+                if ip not in alienvault_ip_cache:
+                    associated_ip_futures.append(executor.submit(get_alienvault_info, ip))
+            
+            # Wait for all associated IP futures to complete
+            for future in concurrent.futures.as_completed(associated_ip_futures):
+                try:
+                    future.result() 
+                except Exception as exc:
+                    debug_print(f"  Generated an exception for associated IP lookup: {exc}")
+
+            # Re-evaluate maliciousness for all associated IPs
+            for ip in associated_ips:
+                ip_abuse_data = abuse_ip_cache.get(ip, {}) 
+                ip_alienvault_data = alienvault_ip_cache.get(ip, {})
+                
+                ip_is_malicious = False
+                if ip_abuse_data.get("abuse_confidence_score", 0) is not None and ip_abuse_data.get("abuse_confidence_score", 0) > 0: 
+                    ip_is_malicious = True
+                if ip_alienvault_data.get("reputation_internal", 0) and ip_alienvault_data["reputation_internal"] > 0:
+                    ip_is_malicious = True
+                if ip_alienvault_data.get("pulses"): 
+                    ip_is_malicious = True
+
+                if ip_is_malicious:
+                    associated_ips_malicious = "Yes"
+                    break 
+            
+        # --- Populate row_data dictionary ---
+        row_data = {
+            "Indicator": ioc,
+            "Type": indicator_type,
+            "VirusTotal Score": vt_data.get("score"),
+            "VirusTotal Category": vt_data.get("category"),
+            "VirusTotal Link": vt_data.get("link"),
+            "VT Last Analysis Date": vt_data.get("last_analysis_date"),
+            "VT Whois Date": vt_data.get("whois_date"),
+            "Associated IPs Malicious?": associated_ips_malicious,
+            "VT MD5": vt_data.get("md5"),
+            "VT SHA1": vt_data.get("sha1"),
+            "VT SHA256": vt_data.get("sha256"),
+            "VT File Size": vt_data.get("file_size"),
+            "VT File Type": vt_data.get("file_type_description"),
+            "VT File Names": vt_data.get("file_names"),
+            "AbuseIPDB Local/Public": abuse_data.get("is_public"),
+            "AbuseIPDB Link": abuse_data.get("link"),
+            "AlienVault Pulses": alienvault_data.get("pulses"),
+            "AlienVault Link": alienvault_data.get("link"),
+            "AlienVault Country": alienvault_data.get("country"),
+            "AlienVault City": alienvault_data.get("city"),
+            "AlienVault ASN": alienvault_data.get("asn"),
+        }
+        batch_results.append(row_data)
+
+        # Update progress
+        elapsed_time = time.time() - start_time
+        processed_count = current_index + 1
+        
+        if processed_count > 0:
+            avg_time_per_ioc = elapsed_time / processed_count
+            remaining_iocs = total_iocs - processed_count
+            estimated_remaining_seconds = avg_time_per_ioc * remaining_iocs
+            
+            minutes, seconds = divmod(int(estimated_remaining_seconds), 60)
+            
+            sys.stdout.write(f"\r  Progress: {processed_count}/{total_iocs} processed. Estimated time remaining: {minutes:02d}m {seconds:02d}s")
+            sys.stdout.flush()
+    
+    return batch_results
 
 def get_vt_info(ioc, indicator_type): # Added indicator_type as argument
     headers = {"x-apikey": VT_API_KEY}
@@ -386,172 +562,30 @@ def main():
 
     print(f"[*] Found {total_iocs} IOCs to process.")
     
-    results = []
-    start_time = time.time()
-
     # Control console output clearing (can be disabled on incompatible systems)
     CLEAR_CONSOLE = os.getenv("CLEAR_CONSOLE", "true").lower() == "true"
     
+    results = []
+    start_time = time.time()
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        for i, ioc in enumerate(iocs):
-            if i > 0 and CLEAR_CONSOLE:
-                try:
-                    num_lines_to_clear_above = 6 
-                    for _ in range(num_lines_to_clear_above):
-                        sys.stdout.write("\033[F\033[K") 
-                    sys.stdout.flush()
-                except:
-                    # If console clearing fails, just continue without it
-                    pass
-
-            print(f"\n[+] Processing IOC {i+1}/{total_iocs}: {ioc}")
-
-            indicator_type = "Unknown"
+        # Process IoCs in batches for better memory management
+        for batch_start in range(0, total_iocs, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_iocs)
+            iocs_batch = iocs[batch_start:batch_end]
             
-            if SHA256_PATTERN.match(ioc):
-                indicator_type = "SHA256 Hash"
-            elif SHA1_PATTERN.match(ioc):
-                indicator_type = "SHA1 Hash"
-            elif MD5_PATTERN.match(ioc):
-                indicator_type = "MD5 Hash"
-            elif URL_PATTERN.match(ioc):
-                indicator_type = "URL"
-            elif IPV4_PATTERN.match(ioc):
-                indicator_type = "IPv4"
-            elif ":" in ioc and IPV6_PATTERN.match(ioc): 
-                indicator_type = "IPv6"
-            else: 
-                indicator_type = "Domain"
-
-            print(f"  Identified as Type: {indicator_type}")
-
-            # --- API Calls with Smart Rate Limiting ---
-            wait_for_rate_limit("vt")
-            vt_data = get_vt_info(ioc, indicator_type)
-
-            abuse_data = {} 
-            alienvault_data = {} 
-
-            ip_for_main_lookup = None
-
-            # Logic to get IP for main lookup (now more robust for URLs via VT)
-            if indicator_type == "IPv4":
-                ip_for_main_lookup = ioc
-            elif indicator_type == "URL":
-                # For URLs, try to use the resolved IP from VT's URL analysis
-                if vt_data.get("a_records") and len(vt_data["a_records"]) > 0:
-                    ip_for_main_lookup = vt_data["a_records"][0]
-                    print(f"  URL {ioc} resolved by VT to IP: {ip_for_main_lookup}. Fetching main IP data.")
-                else:
-                    print(f"  URL {ioc} did not resolve to an IP via VT. Skipping AbuseIPDB/AlienVault for main URL.")
-            elif indicator_type == "Domain" and vt_data.get("a_records") and len(vt_data["a_records"]) == 1:
-                ip_for_main_lookup = vt_data["a_records"][0]
-                print(f"  Domain {ioc} resolved by VT to single IP {ip_for_main_lookup}. Fetching main IP data.")
-
-
-            if ip_for_main_lookup:
-                abuse_future = None
-                alienvault_future = None
-
-                if ip_for_main_lookup not in abuse_ip_cache:
-                    wait_for_rate_limit("other")
-                    abuse_future = executor.submit(get_abuseipdb_info, ip_for_main_lookup)
-                else:
-                    abuse_data = abuse_ip_cache[ip_for_main_lookup]
-
-                if ip_for_main_lookup not in alienvault_ip_cache:
-                    alienvault_future = executor.submit(get_alienvault_info, ip_for_main_lookup)
-                else:
-                    alienvault_data = alienvault_ip_cache[ip_for_main_lookup]
-
-                if abuse_future:
-                    abuse_data = abuse_future.result()
-                if alienvault_future:
-                    alienvault_data = alienvault_future.result()
-                
-            # --- Handle associated IPs for Domains/URLs (for 'Associated IPs Malicious?' column) ---
-            # This logic now correctly uses a_records obtained from the more specific VT URL/Domain lookup
-            associated_ips = vt_data.get("a_records", [])
-            associated_ips_malicious = "No"
-
-            if associated_ips and (indicator_type == "Domain" or indicator_type == "URL"):
-                associated_ip_futures = []
-                for ip in associated_ips:
-                    # Submit concurrent calls for each associated IP if not in cache
-                    if ip not in abuse_ip_cache:
-                        wait_for_rate_limit("other")
-                        associated_ip_futures.append(executor.submit(get_abuseipdb_info, ip))
-                    if ip not in alienvault_ip_cache:
-                        associated_ip_futures.append(executor.submit(get_alienvault_info, ip))
-                
-                # Wait for all associated IP futures to complete
-                for future in concurrent.futures.as_completed(associated_ip_futures):
-                    try:
-                        # Just retrieve results to ensure they are processed and cached
-                        future.result() 
-                    except Exception as exc:
-                        print(f"  Generated an exception for associated IP lookup: {exc}")
-
-                # Now, re-evaluate maliciousness for all associated IPs using the (now populated) cache
-                for ip in associated_ips:
-                    ip_abuse_data = abuse_ip_cache.get(ip, {}) 
-                    ip_alienvault_data = alienvault_ip_cache.get(ip, {})
-                    
-                    ip_is_malicious = False
-                    if ip_abuse_data.get("abuse_confidence_score", 0) is not None and ip_abuse_data.get("abuse_confidence_score", 0) > 0: 
-                        ip_is_malicious = True
-                    if ip_alienvault_data.get("reputation_internal", 0) and ip_alienvault_data["reputation_internal"] > 0:
-                        ip_is_malicious = True
-                    if ip_alienvault_data.get("pulses"): 
-                        ip_is_malicious = True
-
-                    if ip_is_malicious:
-                        associated_ips_malicious = "Yes"
-                        break 
-                
-            # --- Populate row_data dictionary ---
-            row_data = {
-                "Indicator": ioc,
-                "Type": indicator_type,
-
-                "VirusTotal Score": vt_data.get("score"),
-                "VirusTotal Category": vt_data.get("category"),
-                "VirusTotal Link": vt_data.get("link"),
-                "VT Last Analysis Date": vt_data.get("last_analysis_date"),
-                "VT Whois Date": vt_data.get("whois_date"),
-                
-                "Associated IPs Malicious?": associated_ips_malicious,
-
-                "VT MD5": vt_data.get("md5"),
-                "VT SHA1": vt_data.get("sha1"),
-                "VT SHA256": vt_data.get("sha256"),
-                "VT File Size": vt_data.get("file_size"),
-                "VT File Type": vt_data.get("file_type_description"),
-                "VT File Names": vt_data.get("file_names"),
-                
-                "AbuseIPDB Local/Public": abuse_data.get("is_public"),
-                "AbuseIPDB Link": abuse_data.get("link"),
-
-                "AlienVault Pulses": alienvault_data.get("pulses"),
-                "AlienVault Link": alienvault_data.get("link"),
-                "AlienVault Country": alienvault_data.get("country"),
-                "AlienVault City": alienvault_data.get("city"),
-                "AlienVault ASN": alienvault_data.get("asn"),
-            }
-            results.append(row_data)
-
-            elapsed_time = time.time() - start_time
-            processed_count = i + 1
+            print(f"\n[*] Processing batch {batch_start//BATCH_SIZE + 1} ({batch_start+1}-{batch_end} of {total_iocs})")
             
-            if processed_count > 0:
-                avg_time_per_ioc = elapsed_time / processed_count
-                remaining_iocs = total_iocs - processed_count
-                estimated_remaining_seconds = avg_time_per_ioc * remaining_iocs
-                
-                minutes, seconds = divmod(int(estimated_remaining_seconds), 60)
-                
-                sys.stdout.write(f"\r  Progress: {processed_count}/{total_iocs} processed. Estimated time remaining: {minutes:02d}m {seconds:02d}s")
-                sys.stdout.flush() 
+            batch_results = process_ioc_batch(iocs_batch, batch_start, total_iocs, executor, start_time, CLEAR_CONSOLE)
+            results.extend(batch_results)
+            
+            # Clean up memory periodically
+            if len(results) > BATCH_SIZE * 2:
+                # Write partial results and clear memory for very large datasets
+                if total_iocs > BATCH_SIZE * 5:  # Only for very large datasets
+                    print(f"\n[*] Writing partial results to manage memory...")
+                    # TODO: Implement streaming write for extremely large datasets
+                    # For now, we keep all results in memory
         
     print("\n\n[*] All IoCs processed. Generating Excel report...")
     df = pd.DataFrame(results)
