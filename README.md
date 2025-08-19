@@ -43,9 +43,13 @@ Input (`example_input.txt`):
 
 ```
 8.8.8.8
-malicious[.]domain[.]com
-hxxps[:]//bad[.]site
-44d88612fea8a8f36de82e1278abb02f
+1.1.1.1
+www.example.com
+http://malicious-url.com
+https://phishing-site.org
+d41d8cd98f00b204e9800998ecf8427e
+e99a18c428cb38d5f260853678922e03
+3a7bd3e2360a2e129a5c9e8d1f7d1e6b
 ```
 
 Sample Output: See `example_input_IOC_Validate_20250819_103202`.
@@ -61,4 +65,5 @@ python test_ioc_validation.py iocs.txt
 ## License
 
 MIT License (see LICENSE.txt)
+
 
