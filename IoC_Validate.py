@@ -389,7 +389,7 @@ def main():
                     ip_alienvault_data = alienvault_ip_cache.get(ip, {})
                     
                     ip_is_malicious = False
-                    if ip_abuse_data.get("abuse_confidence_score", 0) > 0: 
+                    if ip_abuse_data.get("abuse_confidence_score", 0) is not None and ip_abuse_data.get("abuse_confidence_score", 0) > 0: 
                         ip_is_malicious = True
                     if ip_alienvault_data.get("reputation_internal", 0) and ip_alienvault_data["reputation_internal"] > 0:
                         ip_is_malicious = True
@@ -444,14 +444,14 @@ def main():
                 sys.stdout.write(f"\r  Progress: {processed_count}/{total_iocs} processed. Estimated time remaining: {minutes:02d}m {seconds:02d}s")
                 sys.stdout.flush() 
         
-    print("\n\n[*] All IOCs processed. Generating Excel report...")
+    print("\n\n[*] All IoCs processed. Generating Excel report...")
     df = pd.DataFrame(results)
     
     output_folder = r"C:\Users\pranay.singh\OneDrive - Osborne Clarke\Desktop\IoC"
     
     base_filename_without_ext = os.path.splitext(os.path.basename(input_filename))[0]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") 
-    output_base_filename = f"{base_filename_without_ext}_IOC_Validate_{timestamp}.xlsx"
+    output_base_filename = f"{base_filename_without_ext}_IoC_Validate_{timestamp}.xlsx"
     output_filename_full_path = os.path.join(output_folder, output_base_filename)
 
     os.makedirs(output_folder, exist_ok=True) 
@@ -486,3 +486,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
