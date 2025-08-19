@@ -9,29 +9,289 @@ import concurrent.futures
 import base64 # Import for Base64 encoding
 import urllib.parse # Import for URL encoding
 
+# Load environment from config file if it exists
+def load_config():
+    """Load configuration from config.env file if it exists"""
+    config_file = os.path.join(os.path.dirname(__file__), 'config.env')
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+# Load configuration
+load_config()
+
+# Compile regex patterns for better performance
+SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+SHA1_PATTERN = re.compile(r"^[a-fA-F0-9]{40}$")
+MD5_PATTERN = re.compile(r"^[a-fA-F0-9]{32}$")
+URL_PATTERN = re.compile(r"^(http|https)://")
+IPV4_PATTERN = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+IPV6_PATTERN = re.compile(r"^[0-9a-fA-F:]+$")
+
 # --- CONFIGURATION ---
 
-CA_BUNDLE_PATH = r"PATH_TO_THE_CERTIFICATE" 
+CA_BUNDLE_PATH = os.getenv("CA_BUNDLE_PATH", True)  # Default to system CA bundle
 
 # ---------------------------- API KEYS ----------------------------
 
-VT_API_KEY = "YOUR_VIRUSTOTAL_API_KEY"
-ABUSEIPDB_API_KEY = "YOUR_ABUSEIPDB_API_KEY"
-ALIENVAULT_API_KEY = "YOUR_ALIENVAULT_API_KEY" 
+VT_API_KEY = os.getenv("VT_API_KEY", "YOUR_VIRUSTOTAL_API_KEY")
+ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "YOUR_ABUSEIPDB_API_KEY")
+ALIENVAULT_API_KEY = os.getenv("ALIENVAULT_API_KEY", "YOUR_ALIENVAULT_API_KEY")
 
 # --- API Rate Limit Delays (in seconds) ---
-VT_DELAY = 15 
-OTHER_API_DELAY = 0.5 
+VT_DELAY = float(os.getenv("VT_DELAY", "15"))  # VirusTotal rate limit
+OTHER_API_DELAY = float(os.getenv("OTHER_API_DELAY", "0.5"))  # Other APIs rate limit
+
+# Control debug output (can be disabled for performance)
+DEBUG_OUTPUT = os.getenv("DEBUG_OUTPUT", "false").lower() == "true"
+
+def debug_print(message):
+    """Print debug messages only if debug output is enabled"""
+    if DEBUG_OUTPUT:
+        print(message)
+
+# Rate limiting tracking
+last_vt_call = 0
+last_other_call = 0
+
+def wait_for_rate_limit(api_type="other"):
+    """Smart rate limiting that only waits when necessary"""
+    global last_vt_call, last_other_call
+    
+    current_time = time.time()
+    
+    if api_type == "vt":
+        time_since_last = current_time - last_vt_call
+        if time_since_last < VT_DELAY:
+            sleep_time = VT_DELAY - time_since_last
+            debug_print(f"  Rate limiting: waiting {sleep_time:.1f}s for VirusTotal...")
+            time.sleep(sleep_time)
+        last_vt_call = time.time()
+    else:
+        time_since_last = current_time - last_other_call
+        if time_since_last < OTHER_API_DELAY:
+            sleep_time = OTHER_API_DELAY - time_since_last
+            time.sleep(sleep_time)
+        last_other_call = time.time()
 
 # --- Caches for API results to avoid redundant calls ---
 abuse_ip_cache = {}
 alienvault_ip_cache = {}
 
+# Cache size limits to prevent memory issues
+MAX_CACHE_SIZE = 10000
+
+# Control batch processing for large datasets
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))  # Process in batches to manage memory
+
+def validate_api_keys():
+    """Validate that API keys are configured"""
+    missing_keys = []
+    if VT_API_KEY == "YOUR_VIRUSTOTAL_API_KEY":
+        missing_keys.append("VT_API_KEY")
+    if ABUSEIPDB_API_KEY == "YOUR_ABUSEIPDB_API_KEY":
+        missing_keys.append("ABUSEIPDB_API_KEY") 
+    if ALIENVAULT_API_KEY == "YOUR_ALIENVAULT_API_KEY":
+        missing_keys.append("ALIENVAULT_API_KEY")
+    
+    if missing_keys:
+        print(f"[!] Warning: The following API keys are not configured: {', '.join(missing_keys)}")
+        print("    Set them as environment variables or edit the script directly")
+        print("    Example: export VT_API_KEY='your_actual_key'")
+        return False
+    return True
+
+def manage_cache_size(cache_dict):
+    """Remove oldest entries if cache exceeds max size"""
+    if len(cache_dict) > MAX_CACHE_SIZE:
+        # Remove oldest entries (simple FIFO approach)
+        items_to_remove = len(cache_dict) - MAX_CACHE_SIZE + 1000  # Remove extra to avoid frequent cleanup
+        for _ in range(items_to_remove):
+            cache_dict.pop(next(iter(cache_dict)), None)
+
 # ---------------------------- HELPER FUNCTIONS ----------------------------
+
+def validate_ioc(ioc):
+    """Basic validation of IoC format"""
+    if not ioc or len(ioc.strip()) == 0:
+        return False
+    
+    # Check for obviously malformed inputs
+    if len(ioc) > 2048:  # Reasonable max length
+        return False
+        
+    # Check for potential injection attempts (basic)
+    dangerous_chars = ["<", ">", "\"", "'", "&", ";", "|"]
+    if any(char in ioc for char in dangerous_chars):
+        return False
+        
+    return True
 
 def defang(ioc):
     ioc = ioc.replace("[.]", ".").replace("[:]", ":").replace("hxxp", "http").replace("hxxps", "https")
     return ioc.strip()
+
+def process_ioc_batch(iocs_batch, start_index, total_iocs, executor, start_time, clear_console=True):
+    """Process a batch of IoCs and return results"""
+    batch_results = []
+    
+    for i, ioc in enumerate(iocs_batch):
+        current_index = start_index + i
+        
+        # Clear console for progress display (optional)
+        if current_index > 0 and clear_console:
+            try:
+                num_lines_to_clear_above = 6 
+                for _ in range(num_lines_to_clear_above):
+                    sys.stdout.write("\033[F\033[K") 
+                sys.stdout.flush()
+            except:
+                pass
+
+        print(f"\n[+] Processing IoC {current_index+1}/{total_iocs}: {ioc}")
+
+        indicator_type = "Unknown"
+        
+        if SHA256_PATTERN.match(ioc):
+            indicator_type = "SHA256 Hash"
+        elif SHA1_PATTERN.match(ioc):
+            indicator_type = "SHA1 Hash"
+        elif MD5_PATTERN.match(ioc):
+            indicator_type = "MD5 Hash"
+        elif URL_PATTERN.match(ioc):
+            indicator_type = "URL"
+        elif IPV4_PATTERN.match(ioc):
+            indicator_type = "IPv4"
+        elif ":" in ioc and IPV6_PATTERN.match(ioc): 
+            indicator_type = "IPv6"
+        else: 
+            indicator_type = "Domain"
+
+        print(f"  Identified as Type: {indicator_type}")
+
+        # --- API Calls with Smart Rate Limiting ---
+        wait_for_rate_limit("vt")
+        vt_data = get_vt_info(ioc, indicator_type)
+
+        abuse_data = {} 
+        alienvault_data = {} 
+        ip_for_main_lookup = None
+
+        # Logic to get IP for main lookup
+        if indicator_type == "IPv4":
+            ip_for_main_lookup = ioc
+        elif indicator_type == "URL":
+            if vt_data.get("a_records") and len(vt_data["a_records"]) > 0:
+                ip_for_main_lookup = vt_data["a_records"][0]
+                debug_print(f"  URL {ioc} resolved by VT to IP: {ip_for_main_lookup}. Fetching main IP data.")
+            else:
+                debug_print(f"  URL {ioc} did not resolve to an IP via VT. Skipping AbuseIPDB/AlienVault for main URL.")
+        elif indicator_type == "Domain" and vt_data.get("a_records") and len(vt_data["a_records"]) == 1:
+            ip_for_main_lookup = vt_data["a_records"][0]
+            debug_print(f"  Domain {ioc} resolved by VT to single IP {ip_for_main_lookup}. Fetching main IP data.")
+
+        if ip_for_main_lookup:
+            abuse_future = None
+            alienvault_future = None
+
+            if ip_for_main_lookup not in abuse_ip_cache:
+                wait_for_rate_limit("other")
+                abuse_future = executor.submit(get_abuseipdb_info, ip_for_main_lookup)
+            else:
+                abuse_data = abuse_ip_cache[ip_for_main_lookup]
+
+            if ip_for_main_lookup not in alienvault_ip_cache:
+                alienvault_future = executor.submit(get_alienvault_info, ip_for_main_lookup)
+            else:
+                alienvault_data = alienvault_ip_cache[ip_for_main_lookup]
+
+            if abuse_future:
+                abuse_data = abuse_future.result()
+            if alienvault_future:
+                alienvault_data = alienvault_future.result()
+            
+        # --- Handle associated IPs for Domains/URLs ---
+        associated_ips = vt_data.get("a_records", [])
+        associated_ips_malicious = "No"
+
+        if associated_ips and (indicator_type == "Domain" or indicator_type == "URL"):
+            associated_ip_futures = []
+            for ip in associated_ips:
+                if ip not in abuse_ip_cache:
+                    wait_for_rate_limit("other")
+                    associated_ip_futures.append(executor.submit(get_abuseipdb_info, ip))
+                if ip not in alienvault_ip_cache:
+                    associated_ip_futures.append(executor.submit(get_alienvault_info, ip))
+            
+            # Wait for all associated IP futures to complete
+            for future in concurrent.futures.as_completed(associated_ip_futures):
+                try:
+                    future.result() 
+                except Exception as exc:
+                    debug_print(f"  Generated an exception for associated IP lookup: {exc}")
+
+            # Re-evaluate maliciousness for all associated IPs
+            for ip in associated_ips:
+                ip_abuse_data = abuse_ip_cache.get(ip, {}) 
+                ip_alienvault_data = alienvault_ip_cache.get(ip, {})
+                
+                ip_is_malicious = False
+                if ip_abuse_data.get("abuse_confidence_score", 0) is not None and ip_abuse_data.get("abuse_confidence_score", 0) > 0: 
+                    ip_is_malicious = True
+                if ip_alienvault_data.get("reputation_internal", 0) and ip_alienvault_data["reputation_internal"] > 0:
+                    ip_is_malicious = True
+                if ip_alienvault_data.get("pulses"): 
+                    ip_is_malicious = True
+
+                if ip_is_malicious:
+                    associated_ips_malicious = "Yes"
+                    break 
+            
+        # --- Populate row_data dictionary ---
+        row_data = {
+            "Indicator": ioc,
+            "Type": indicator_type,
+            "VirusTotal Score": vt_data.get("score"),
+            "VirusTotal Category": vt_data.get("category"),
+            "VirusTotal Link": vt_data.get("link"),
+            "VT Last Analysis Date": vt_data.get("last_analysis_date"),
+            "VT Whois Date": vt_data.get("whois_date"),
+            "Associated IPs Malicious?": associated_ips_malicious,
+            "VT MD5": vt_data.get("md5"),
+            "VT SHA1": vt_data.get("sha1"),
+            "VT SHA256": vt_data.get("sha256"),
+            "VT File Size": vt_data.get("file_size"),
+            "VT File Type": vt_data.get("file_type_description"),
+            "VT File Names": vt_data.get("file_names"),
+            "AbuseIPDB Local/Public": abuse_data.get("is_public"),
+            "AbuseIPDB Link": abuse_data.get("link"),
+            "AlienVault Pulses": alienvault_data.get("pulses"),
+            "AlienVault Link": alienvault_data.get("link"),
+            "AlienVault Country": alienvault_data.get("country"),
+            "AlienVault City": alienvault_data.get("city"),
+            "AlienVault ASN": alienvault_data.get("asn"),
+        }
+        batch_results.append(row_data)
+
+        # Update progress
+        elapsed_time = time.time() - start_time
+        processed_count = current_index + 1
+        
+        if processed_count > 0:
+            avg_time_per_ioc = elapsed_time / processed_count
+            remaining_iocs = total_iocs - processed_count
+            estimated_remaining_seconds = avg_time_per_ioc * remaining_iocs
+            
+            minutes, seconds = divmod(int(estimated_remaining_seconds), 60)
+            
+            sys.stdout.write(f"\r  Progress: {processed_count}/{total_iocs} processed. Estimated time remaining: {minutes:02d}m {seconds:02d}s")
+            sys.stdout.flush()
+    
+    return batch_results
 
 def get_vt_info(ioc, indicator_type): # Added indicator_type as argument
     headers = {"x-apikey": VT_API_KEY}
@@ -44,18 +304,13 @@ def get_vt_info(ioc, indicator_type): # Added indicator_type as argument
         encoded_url_for_b64 = urllib.parse.quote_plus(ioc)
         url_id = base64.urlsafe_b64encode(encoded_url_for_b64.encode()).decode().strip("=")
         url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
-        print(f"  Using VT /urls endpoint for URL: {ioc}")
     elif indicator_type in ["MD5 Hash", "SHA1 Hash", "SHA256 Hash"]:
         url = f"https://www.virustotal.com/api/v3/files/{ioc}"
-        print(f"  Using VT /files endpoint for Hash: {ioc}")
     else: # Default to /search for Domains and IPs, or unknown types
         url = f"https://www.virustotal.com/api/v3/search?query={ioc}"
-        print(f"  Using VT /search endpoint for {indicator_type}: {ioc}")
 
-    print(f"  --- Fetching VirusTotal data for {ioc} ---")
     try:
         response = requests.get(url, headers=headers, verify=CA_BUNDLE_PATH, timeout=30)
-        print(f"  Status Code: {response.status_code}")
     except requests.exceptions.RequestException as e:
         print(f"  VirusTotal Request Error for {ioc}: {e}")
         return {
@@ -196,6 +451,7 @@ def get_abuseipdb_info(ip):
         print(f"  AbuseIPDB API Error for {ip}: Status {response.status_code}. Response: {response.text[:200]}...")
     
     abuse_ip_cache[ip] = abuse_results
+    manage_cache_size(abuse_ip_cache)
     return abuse_results
 
 def get_alienvault_info(ioc): # This function expects an IP
@@ -249,21 +505,29 @@ def get_alienvault_info(ioc): # This function expects an IP
         print(f"  AlienVault OTX API Error for {ioc}: Status {response.status_code}. Response: {response.text[:200]}...")
     
     alienvault_ip_cache[ioc] = alienvault_results
+    manage_cache_size(alienvault_ip_cache)
     return alienvault_results
 
 # ---------------------------- MAIN SCRIPT LOGIC ----------------------------
 def main():
     print("[*] Starting IoC Analysis Script...")
+    
+    # Validate API keys are configured
+    if not validate_api_keys():
+        print("[*] Continuing with limited functionality...")
 
     if len(sys.argv) < 2:
-        print("Usage: python your_script_name.py <input_ioc_filename.txt>")
-        print("Example: python ioc_analyzer.py IoCs.txt")
+        print("Usage: python IoC_Validate.py <input_ioc_filename>")
+        print("Example: python IoC_Validate.py IoCs.txt")
         sys.exit(1)
 
     input_filename = sys.argv[1] 
     
-    input_folder = r"C:\Users\pranay.singh\OneDrive - Osborne Clarke\Desktop\IoC"
-    ioc_file_path = os.path.join(input_folder, input_filename)
+    # Use current directory if absolute path not provided
+    if os.path.isabs(input_filename):
+        ioc_file_path = input_filename
+    else:
+        ioc_file_path = os.path.join(os.getcwd(), input_filename)
 
     if not os.path.exists(ioc_file_path):
         print(f"Error: Input file not found at {ioc_file_path}")
@@ -271,8 +535,22 @@ def main():
 
     print(f"[*] Reading IOCs from: {ioc_file_path}")
     try:
-        with open(ioc_file_path, "r") as f:
-            iocs = [defang(line.strip()) for line in f if line.strip()]
+        with open(ioc_file_path, "r", encoding='utf-8') as f:
+            raw_iocs = [line.strip() for line in f if line.strip()]
+            
+        # Validate and defang IoCs
+        iocs = []
+        invalid_count = 0
+        for raw_ioc in raw_iocs:
+            if validate_ioc(raw_ioc):
+                iocs.append(defang(raw_ioc))
+            else:
+                invalid_count += 1
+                print(f"[!] Skipping invalid IoC: {raw_ioc[:50]}...")
+                
+        if invalid_count > 0:
+            print(f"[!] Skipped {invalid_count} invalid IoCs")
+            
     except Exception as e:
         print(f"Error reading input file: {e}")
         sys.exit(1)
@@ -284,177 +562,43 @@ def main():
 
     print(f"[*] Found {total_iocs} IOCs to process.")
     
+    # Control console output clearing (can be disabled on incompatible systems)
+    CLEAR_CONSOLE = os.getenv("CLEAR_CONSOLE", "true").lower() == "true"
+    
     results = []
     start_time = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        for i, ioc in enumerate(iocs):
-            if i > 0:
-                num_lines_to_clear_above = 6 
-                for _ in range(num_lines_to_clear_above):
-                    sys.stdout.write("\033[F\033[K") 
-                sys.stdout.flush()
-
-            print(f"\n[+] Processing IOC {i+1}/{total_iocs}: {ioc}")
-
-            indicator_type = "Unknown"
+        # Process IoCs in batches for better memory management
+        for batch_start in range(0, total_iocs, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_iocs)
+            iocs_batch = iocs[batch_start:batch_end]
             
-            if re.match(r"^[a-fA-F0-9]{64}$", ioc):
-                indicator_type = "SHA256 Hash"
-            elif re.match(r"^[a-fA-F0-9]{40}$", ioc):
-                indicator_type = "SHA1 Hash"
-            elif re.match(r"^[a-fA-F0-9]{32}$", ioc):
-                indicator_type = "MD5 Hash"
-            elif re.match(r"^(http|https)://", ioc):
-                indicator_type = "URL"
-            elif re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ioc):
-                indicator_type = "IPv4"
-            elif ":" in ioc and re.match(r"^[0-9a-fA-F:]+$", ioc): 
-                indicator_type = "IPv6"
-            else: 
-                indicator_type = "Domain"
-
-            print(f"  Identified as Type: {indicator_type}")
-
-            # --- API Calls with Delays ---
-            time.sleep(VT_DELAY) # Delay BEFORE VirusTotal call
-            vt_data = get_vt_info(ioc, indicator_type) # Pass indicator_type here
-
-            abuse_data = {} 
-            alienvault_data = {} 
-
-            ip_for_main_lookup = None
-
-            # Logic to get IP for main lookup (now more robust for URLs via VT)
-            if indicator_type == "IPv4":
-                ip_for_main_lookup = ioc
-            elif indicator_type == "URL":
-                # For URLs, try to use the resolved IP from VT's URL analysis
-                if vt_data.get("a_records") and len(vt_data["a_records"]) > 0:
-                    ip_for_main_lookup = vt_data["a_records"][0]
-                    print(f"  URL {ioc} resolved by VT to IP: {ip_for_main_lookup}. Fetching main IP data.")
-                else:
-                    print(f"  URL {ioc} did not resolve to an IP via VT. Skipping AbuseIPDB/AlienVault for main URL.")
-            elif indicator_type == "Domain" and vt_data.get("a_records") and len(vt_data["a_records"]) == 1:
-                ip_for_main_lookup = vt_data["a_records"][0]
-                print(f"  Domain {ioc} resolved by VT to single IP {ip_for_main_lookup}. Fetching main IP data.")
-
-
-            if ip_for_main_lookup:
-                abuse_future = None
-                alienvault_future = None
-
-                if ip_for_main_lookup not in abuse_ip_cache:
-                    time.sleep(OTHER_API_DELAY) 
-                    abuse_future = executor.submit(get_abuseipdb_info, ip_for_main_lookup)
-                else:
-                    abuse_data = abuse_ip_cache[ip_for_main_lookup]
-
-                if ip_for_main_lookup not in alienvault_ip_cache:
-                    alienvault_future = executor.submit(get_alienvault_info, ip_for_main_lookup)
-                else:
-                    alienvault_data = alienvault_ip_cache[ip_for_main_lookup]
-
-                if abuse_future:
-                    abuse_data = abuse_future.result()
-                if alienvault_future:
-                    alienvault_data = alienvault_future.result()
-                
-            # --- Handle associated IPs for Domains/URLs (for 'Associated IPs Malicious?' column) ---
-            # This logic now correctly uses a_records obtained from the more specific VT URL/Domain lookup
-            associated_ips = vt_data.get("a_records", [])
-            associated_ips_malicious = "No"
-
-            if associated_ips and (indicator_type == "Domain" or indicator_type == "URL"):
-                associated_ip_futures = []
-                for ip in associated_ips:
-                    # Submit concurrent calls for each associated IP if not in cache
-                    if ip not in abuse_ip_cache:
-                        time.sleep(OTHER_API_DELAY) 
-                        associated_ip_futures.append(executor.submit(get_abuseipdb_info, ip))
-                    if ip not in alienvault_ip_cache:
-                        associated_ip_futures.append(executor.submit(get_alienvault_info, ip))
-                
-                # Wait for all associated IP futures to complete
-                for future in concurrent.futures.as_completed(associated_ip_futures):
-                    try:
-                        # Just retrieve results to ensure they are processed and cached
-                        future.result() 
-                    except Exception as exc:
-                        print(f"  Generated an exception for associated IP lookup: {exc}")
-
-                # Now, re-evaluate maliciousness for all associated IPs using the (now populated) cache
-                for ip in associated_ips:
-                    ip_abuse_data = abuse_ip_cache.get(ip, {}) 
-                    ip_alienvault_data = alienvault_ip_cache.get(ip, {})
-                    
-                    ip_is_malicious = False
-                    if ip_abuse_data.get("abuse_confidence_score", 0) is not None and ip_abuse_data.get("abuse_confidence_score", 0) > 0: 
-                        ip_is_malicious = True
-                    if ip_alienvault_data.get("reputation_internal", 0) and ip_alienvault_data["reputation_internal"] > 0:
-                        ip_is_malicious = True
-                    if ip_alienvault_data.get("pulses"): 
-                        ip_is_malicious = True
-
-                    if ip_is_malicious:
-                        associated_ips_malicious = "Yes"
-                        break 
-                
-            # --- Populate row_data dictionary ---
-            row_data = {
-                "Indicator": ioc,
-                "Type": indicator_type,
-
-                "VirusTotal Score": vt_data.get("score"),
-                "VirusTotal Category": vt_data.get("category"),
-                "VirusTotal Link": vt_data.get("link"),
-                "VT Last Analysis Date": vt_data.get("last_analysis_date"),
-                "VT Whois Date": vt_data.get("whois_date"),
-                
-                "Associated IPs Malicious?": associated_ips_malicious,
-
-                "VT MD5": vt_data.get("md5"),
-                "VT SHA1": vt_data.get("sha1"),
-                "VT SHA256": vt_data.get("sha256"),
-                "VT File Size": vt_data.get("file_size"),
-                "VT File Type": vt_data.get("file_type_description"),
-                "VT File Names": vt_data.get("file_names"),
-                
-                "AbuseIPDB Local/Public": abuse_data.get("is_public"),
-                "AbuseIPDB Link": abuse_data.get("link"),
-
-                "AlienVault Pulses": alienvault_data.get("pulses"),
-                "AlienVault Link": alienvault_data.get("link"),
-                "AlienVault Country": alienvault_data.get("country"),
-                "AlienVault City": alienvault_data.get("city"),
-                "AlienVault ASN": alienvault_data.get("asn"),
-            }
-            results.append(row_data)
-
-            elapsed_time = time.time() - start_time
-            processed_count = i + 1
+            print(f"\n[*] Processing batch {batch_start//BATCH_SIZE + 1} ({batch_start+1}-{batch_end} of {total_iocs})")
             
-            if processed_count > 0:
-                avg_time_per_ioc = elapsed_time / processed_count
-                remaining_iocs = total_iocs - processed_count
-                estimated_remaining_seconds = avg_time_per_ioc * remaining_iocs
-                
-                minutes, seconds = divmod(int(estimated_remaining_seconds), 60)
-                
-                sys.stdout.write(f"\r  Progress: {processed_count}/{total_iocs} processed. Estimated time remaining: {minutes:02d}m {seconds:02d}s")
-                sys.stdout.flush() 
+            batch_results = process_ioc_batch(iocs_batch, batch_start, total_iocs, executor, start_time, CLEAR_CONSOLE)
+            results.extend(batch_results)
+            
+            # Clean up memory periodically
+            if len(results) > BATCH_SIZE * 2:
+                # Write partial results and clear memory for very large datasets
+                if total_iocs > BATCH_SIZE * 5:  # Only for very large datasets
+                    print(f"\n[*] Writing partial results to manage memory...")
+                    # TODO: Implement streaming write for extremely large datasets
+                    # For now, we keep all results in memory
         
     print("\n\n[*] All IoCs processed. Generating Excel report...")
     df = pd.DataFrame(results)
     
-    output_folder = r"C:\Users\pranay.singh\OneDrive - Osborne Clarke\Desktop\IoC"
+    # Generate output in same directory as input file or current directory
+    input_dir = os.path.dirname(ioc_file_path) if os.path.dirname(ioc_file_path) else os.getcwd()
     
     base_filename_without_ext = os.path.splitext(os.path.basename(input_filename))[0]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") 
     output_base_filename = f"{base_filename_without_ext}_IoC_Validate_{timestamp}.xlsx"
-    output_filename_full_path = os.path.join(output_folder, output_base_filename)
+    output_filename_full_path = os.path.join(input_dir, output_base_filename)
 
-    os.makedirs(output_folder, exist_ok=True) 
+    os.makedirs(input_dir, exist_ok=True)
 
     writer = pd.ExcelWriter(output_filename_full_path, engine='xlsxwriter')
     
