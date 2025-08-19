@@ -52,7 +52,7 @@ e99a18c428cb38d5f260853678922e03
 3a7bd3e2360a2e129a5c9e8d1f7d1e6b
 ```
 
-Sample Output: See `example_input_IOC_Validate_20250819_103202`.
+Sample Output: See `example_input_IoC_Validate_20250819_103202`.
 
 ## Testing
 
@@ -65,5 +65,6 @@ python test_ioc_validation.py iocs.txt
 ## License
 
 MIT License (see LICENSE.txt)
+
 
 
