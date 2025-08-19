@@ -9,25 +9,109 @@ import concurrent.futures
 import base64 # Import for Base64 encoding
 import urllib.parse # Import for URL encoding
 
+# Compile regex patterns for better performance
+SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+SHA1_PATTERN = re.compile(r"^[a-fA-F0-9]{40}$")
+MD5_PATTERN = re.compile(r"^[a-fA-F0-9]{32}$")
+URL_PATTERN = re.compile(r"^(http|https)://")
+IPV4_PATTERN = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+IPV6_PATTERN = re.compile(r"^[0-9a-fA-F:]+$")
+
 # --- CONFIGURATION ---
 
-CA_BUNDLE_PATH = r"PATH_TO_THE_CERTIFICATE" 
+CA_BUNDLE_PATH = os.getenv("CA_BUNDLE_PATH", True)  # Default to system CA bundle
 
 # ---------------------------- API KEYS ----------------------------
 
-VT_API_KEY = "YOUR_VIRUSTOTAL_API_KEY"
-ABUSEIPDB_API_KEY = "YOUR_ABUSEIPDB_API_KEY"
-ALIENVAULT_API_KEY = "YOUR_ALIENVAULT_API_KEY" 
+VT_API_KEY = os.getenv("VT_API_KEY", "YOUR_VIRUSTOTAL_API_KEY")
+ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "YOUR_ABUSEIPDB_API_KEY")
+ALIENVAULT_API_KEY = os.getenv("ALIENVAULT_API_KEY", "YOUR_ALIENVAULT_API_KEY")
 
 # --- API Rate Limit Delays (in seconds) ---
-VT_DELAY = 15 
-OTHER_API_DELAY = 0.5 
+VT_DELAY = float(os.getenv("VT_DELAY", "15"))  # VirusTotal rate limit
+OTHER_API_DELAY = float(os.getenv("OTHER_API_DELAY", "0.5"))  # Other APIs rate limit
+
+# Control debug output (can be disabled for performance)
+DEBUG_OUTPUT = os.getenv("DEBUG_OUTPUT", "false").lower() == "true"
+
+def debug_print(message):
+    """Print debug messages only if debug output is enabled"""
+    if DEBUG_OUTPUT:
+        print(message)
+
+# Rate limiting tracking
+last_vt_call = 0
+last_other_call = 0
+
+def wait_for_rate_limit(api_type="other"):
+    """Smart rate limiting that only waits when necessary"""
+    global last_vt_call, last_other_call
+    
+    current_time = time.time()
+    
+    if api_type == "vt":
+        time_since_last = current_time - last_vt_call
+        if time_since_last < VT_DELAY:
+            sleep_time = VT_DELAY - time_since_last
+            debug_print(f"  Rate limiting: waiting {sleep_time:.1f}s for VirusTotal...")
+            time.sleep(sleep_time)
+        last_vt_call = time.time()
+    else:
+        time_since_last = current_time - last_other_call
+        if time_since_last < OTHER_API_DELAY:
+            sleep_time = OTHER_API_DELAY - time_since_last
+            time.sleep(sleep_time)
+        last_other_call = time.time()
 
 # --- Caches for API results to avoid redundant calls ---
 abuse_ip_cache = {}
 alienvault_ip_cache = {}
 
+# Cache size limits to prevent memory issues
+MAX_CACHE_SIZE = 10000
+
+def validate_api_keys():
+    """Validate that API keys are configured"""
+    missing_keys = []
+    if VT_API_KEY == "YOUR_VIRUSTOTAL_API_KEY":
+        missing_keys.append("VT_API_KEY")
+    if ABUSEIPDB_API_KEY == "YOUR_ABUSEIPDB_API_KEY":
+        missing_keys.append("ABUSEIPDB_API_KEY") 
+    if ALIENVAULT_API_KEY == "YOUR_ALIENVAULT_API_KEY":
+        missing_keys.append("ALIENVAULT_API_KEY")
+    
+    if missing_keys:
+        print(f"[!] Warning: The following API keys are not configured: {', '.join(missing_keys)}")
+        print("    Set them as environment variables or edit the script directly")
+        print("    Example: export VT_API_KEY='your_actual_key'")
+        return False
+    return True
+
+def manage_cache_size(cache_dict):
+    """Remove oldest entries if cache exceeds max size"""
+    if len(cache_dict) > MAX_CACHE_SIZE:
+        # Remove oldest entries (simple FIFO approach)
+        items_to_remove = len(cache_dict) - MAX_CACHE_SIZE + 1000  # Remove extra to avoid frequent cleanup
+        for _ in range(items_to_remove):
+            cache_dict.pop(next(iter(cache_dict)), None)
+
 # ---------------------------- HELPER FUNCTIONS ----------------------------
+
+def validate_ioc(ioc):
+    """Basic validation of IoC format"""
+    if not ioc or len(ioc.strip()) == 0:
+        return False
+    
+    # Check for obviously malformed inputs
+    if len(ioc) > 2048:  # Reasonable max length
+        return False
+        
+    # Check for potential injection attempts (basic)
+    dangerous_chars = ["<", ">", "\"", "'", "&", ";", "|"]
+    if any(char in ioc for char in dangerous_chars):
+        return False
+        
+    return True
 
 def defang(ioc):
     ioc = ioc.replace("[.]", ".").replace("[:]", ":").replace("hxxp", "http").replace("hxxps", "https")
@@ -44,18 +128,13 @@ def get_vt_info(ioc, indicator_type): # Added indicator_type as argument
         encoded_url_for_b64 = urllib.parse.quote_plus(ioc)
         url_id = base64.urlsafe_b64encode(encoded_url_for_b64.encode()).decode().strip("=")
         url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
-        print(f"  Using VT /urls endpoint for URL: {ioc}")
     elif indicator_type in ["MD5 Hash", "SHA1 Hash", "SHA256 Hash"]:
         url = f"https://www.virustotal.com/api/v3/files/{ioc}"
-        print(f"  Using VT /files endpoint for Hash: {ioc}")
     else: # Default to /search for Domains and IPs, or unknown types
         url = f"https://www.virustotal.com/api/v3/search?query={ioc}"
-        print(f"  Using VT /search endpoint for {indicator_type}: {ioc}")
 
-    print(f"  --- Fetching VirusTotal data for {ioc} ---")
     try:
         response = requests.get(url, headers=headers, verify=CA_BUNDLE_PATH, timeout=30)
-        print(f"  Status Code: {response.status_code}")
     except requests.exceptions.RequestException as e:
         print(f"  VirusTotal Request Error for {ioc}: {e}")
         return {
@@ -196,6 +275,7 @@ def get_abuseipdb_info(ip):
         print(f"  AbuseIPDB API Error for {ip}: Status {response.status_code}. Response: {response.text[:200]}...")
     
     abuse_ip_cache[ip] = abuse_results
+    manage_cache_size(abuse_ip_cache)
     return abuse_results
 
 def get_alienvault_info(ioc): # This function expects an IP
@@ -249,21 +329,29 @@ def get_alienvault_info(ioc): # This function expects an IP
         print(f"  AlienVault OTX API Error for {ioc}: Status {response.status_code}. Response: {response.text[:200]}...")
     
     alienvault_ip_cache[ioc] = alienvault_results
+    manage_cache_size(alienvault_ip_cache)
     return alienvault_results
 
 # ---------------------------- MAIN SCRIPT LOGIC ----------------------------
 def main():
     print("[*] Starting IoC Analysis Script...")
+    
+    # Validate API keys are configured
+    if not validate_api_keys():
+        print("[*] Continuing with limited functionality...")
 
     if len(sys.argv) < 2:
-        print("Usage: python your_script_name.py <input_ioc_filename.txt>")
-        print("Example: python ioc_analyzer.py IoCs.txt")
+        print("Usage: python IoC_Validate.py <input_ioc_filename>")
+        print("Example: python IoC_Validate.py IoCs.txt")
         sys.exit(1)
 
     input_filename = sys.argv[1] 
     
-    input_folder = r"C:\Users\pranay.singh\OneDrive - Osborne Clarke\Desktop\IoC"
-    ioc_file_path = os.path.join(input_folder, input_filename)
+    # Use current directory if absolute path not provided
+    if os.path.isabs(input_filename):
+        ioc_file_path = input_filename
+    else:
+        ioc_file_path = os.path.join(os.getcwd(), input_filename)
 
     if not os.path.exists(ioc_file_path):
         print(f"Error: Input file not found at {ioc_file_path}")
@@ -271,8 +359,22 @@ def main():
 
     print(f"[*] Reading IOCs from: {ioc_file_path}")
     try:
-        with open(ioc_file_path, "r") as f:
-            iocs = [defang(line.strip()) for line in f if line.strip()]
+        with open(ioc_file_path, "r", encoding='utf-8') as f:
+            raw_iocs = [line.strip() for line in f if line.strip()]
+            
+        # Validate and defang IoCs
+        iocs = []
+        invalid_count = 0
+        for raw_ioc in raw_iocs:
+            if validate_ioc(raw_ioc):
+                iocs.append(defang(raw_ioc))
+            else:
+                invalid_count += 1
+                print(f"[!] Skipping invalid IoC: {raw_ioc[:50]}...")
+                
+        if invalid_count > 0:
+            print(f"[!] Skipped {invalid_count} invalid IoCs")
+            
     except Exception as e:
         print(f"Error reading input file: {e}")
         sys.exit(1)
@@ -287,38 +389,45 @@ def main():
     results = []
     start_time = time.time()
 
+    # Control console output clearing (can be disabled on incompatible systems)
+    CLEAR_CONSOLE = os.getenv("CLEAR_CONSOLE", "true").lower() == "true"
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         for i, ioc in enumerate(iocs):
-            if i > 0:
-                num_lines_to_clear_above = 6 
-                for _ in range(num_lines_to_clear_above):
-                    sys.stdout.write("\033[F\033[K") 
-                sys.stdout.flush()
+            if i > 0 and CLEAR_CONSOLE:
+                try:
+                    num_lines_to_clear_above = 6 
+                    for _ in range(num_lines_to_clear_above):
+                        sys.stdout.write("\033[F\033[K") 
+                    sys.stdout.flush()
+                except:
+                    # If console clearing fails, just continue without it
+                    pass
 
             print(f"\n[+] Processing IOC {i+1}/{total_iocs}: {ioc}")
 
             indicator_type = "Unknown"
             
-            if re.match(r"^[a-fA-F0-9]{64}$", ioc):
+            if SHA256_PATTERN.match(ioc):
                 indicator_type = "SHA256 Hash"
-            elif re.match(r"^[a-fA-F0-9]{40}$", ioc):
+            elif SHA1_PATTERN.match(ioc):
                 indicator_type = "SHA1 Hash"
-            elif re.match(r"^[a-fA-F0-9]{32}$", ioc):
+            elif MD5_PATTERN.match(ioc):
                 indicator_type = "MD5 Hash"
-            elif re.match(r"^(http|https)://", ioc):
+            elif URL_PATTERN.match(ioc):
                 indicator_type = "URL"
-            elif re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ioc):
+            elif IPV4_PATTERN.match(ioc):
                 indicator_type = "IPv4"
-            elif ":" in ioc and re.match(r"^[0-9a-fA-F:]+$", ioc): 
+            elif ":" in ioc and IPV6_PATTERN.match(ioc): 
                 indicator_type = "IPv6"
             else: 
                 indicator_type = "Domain"
 
             print(f"  Identified as Type: {indicator_type}")
 
-            # --- API Calls with Delays ---
-            time.sleep(VT_DELAY) # Delay BEFORE VirusTotal call
-            vt_data = get_vt_info(ioc, indicator_type) # Pass indicator_type here
+            # --- API Calls with Smart Rate Limiting ---
+            wait_for_rate_limit("vt")
+            vt_data = get_vt_info(ioc, indicator_type)
 
             abuse_data = {} 
             alienvault_data = {} 
@@ -345,7 +454,7 @@ def main():
                 alienvault_future = None
 
                 if ip_for_main_lookup not in abuse_ip_cache:
-                    time.sleep(OTHER_API_DELAY) 
+                    wait_for_rate_limit("other")
                     abuse_future = executor.submit(get_abuseipdb_info, ip_for_main_lookup)
                 else:
                     abuse_data = abuse_ip_cache[ip_for_main_lookup]
@@ -370,7 +479,7 @@ def main():
                 for ip in associated_ips:
                     # Submit concurrent calls for each associated IP if not in cache
                     if ip not in abuse_ip_cache:
-                        time.sleep(OTHER_API_DELAY) 
+                        wait_for_rate_limit("other")
                         associated_ip_futures.append(executor.submit(get_abuseipdb_info, ip))
                     if ip not in alienvault_ip_cache:
                         associated_ip_futures.append(executor.submit(get_alienvault_info, ip))
@@ -447,14 +556,15 @@ def main():
     print("\n\n[*] All IoCs processed. Generating Excel report...")
     df = pd.DataFrame(results)
     
-    output_folder = r"C:\Users\pranay.singh\OneDrive - Osborne Clarke\Desktop\IoC"
+    # Generate output in same directory as input file or current directory
+    input_dir = os.path.dirname(ioc_file_path) if os.path.dirname(ioc_file_path) else os.getcwd()
     
     base_filename_without_ext = os.path.splitext(os.path.basename(input_filename))[0]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") 
     output_base_filename = f"{base_filename_without_ext}_IoC_Validate_{timestamp}.xlsx"
-    output_filename_full_path = os.path.join(output_folder, output_base_filename)
+    output_filename_full_path = os.path.join(input_dir, output_base_filename)
 
-    os.makedirs(output_folder, exist_ok=True) 
+    os.makedirs(input_dir, exist_ok=True)
 
     writer = pd.ExcelWriter(output_filename_full_path, engine='xlsxwriter')
     
