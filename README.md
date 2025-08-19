@@ -48,7 +48,7 @@ hxxps[:]//bad[.]site
 44d88612fea8a8f36de82e1278abb02f
 ```
 
-Sample Output: See `example_output.xlsx`.
+Sample Output: See `example_input_IOC_Validate_20250819_103202`.
 
 ## Testing
 
@@ -61,3 +61,4 @@ python test_ioc_validation.py iocs.txt
 ## License
 
 MIT License (see LICENSE.txt)
+
