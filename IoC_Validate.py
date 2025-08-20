@@ -251,6 +251,35 @@ def get_alienvault_info(ioc): # This function expects an IP
     alienvault_ip_cache[ioc] = alienvault_results
     return alienvault_results
 
+def assess_maliciousness(vt_data, abuse_data, alienvault_data, associated_ips_malicious):
+    """
+    Assess the maliciousness level of an IoC based on data from multiple sources.
+    Returns: "Malicious", "Suspicious", or "Clean"
+    """
+    # Get scores and indicators
+    vt_score = vt_data.get("score", 0) or 0
+    vt_category = vt_data.get("category", "") or ""
+    abuse_score = abuse_data.get("abuse_confidence_score", 0) or 0
+    alienvault_reputation = alienvault_data.get("reputation_internal", 0) or 0
+    alienvault_pulses = alienvault_data.get("pulses")
+    
+    # Criteria for Malicious
+    if (vt_score > 5 or 
+        abuse_score > 75 or 
+        alienvault_reputation > 0 or 
+        (alienvault_pulses and alienvault_pulses.strip()) or
+        associated_ips_malicious == "Yes"):
+        return "Malicious"
+    
+    # Criteria for Suspicious  
+    if (1 <= vt_score <= 5 or 
+        25 <= abuse_score <= 75 or 
+        any(term in vt_category.lower() for term in ["suspicious", "malware", "phishing", "spam", "malicious"])):
+        return "Suspicious"
+    
+    # Default to Clean
+    return "Clean"
+
 # ---------------------------- MAIN SCRIPT LOGIC ----------------------------
 def main():
     print("[*] Starting IoC Analysis Script...")
@@ -400,10 +429,14 @@ def main():
                         associated_ips_malicious = "Yes"
                         break 
                 
+            # --- Assess maliciousness ---
+            maliciousness = assess_maliciousness(vt_data, abuse_data, alienvault_data, associated_ips_malicious)
+            
             # --- Populate row_data dictionary ---
             row_data = {
                 "Indicator": ioc,
                 "Type": indicator_type,
+                "Maliciousness": maliciousness,
 
                 "VirusTotal Score": vt_data.get("score"),
                 "VirusTotal Category": vt_data.get("category"),
